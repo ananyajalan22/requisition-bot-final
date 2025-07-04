@@ -9,6 +9,11 @@ load_dotenv()
 
 # --- Vercel Postgres Database Setup ---
 DATABASE_URL = os.getenv("POSTGRES_URL")
+# --- NEW: Definitive check to ensure the environment variable is loaded ---
+if not DATABASE_URL:
+    # This will cause the deployment to fail with a clear log message
+    # if the POSTGRES_URL is not set on Vercel, preventing 500 errors.
+    raise RuntimeError("FATAL: POSTGRES_URL environment variable is not set.")
 
 def get_db_connection():
     """Establishes a new database connection."""
@@ -154,7 +159,6 @@ def check_supplier_db(supplier_name):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                # --- THE FIX: Using a tuple for parameters is required, even for one item ---
                 cursor.execute("SELECT name, address, contact_number, is_blacklisted FROM supplier_details WHERE name ILIKE %s", (supplier_name,))
                 supplier = cursor.fetchone()
         
