@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import os
 import psycopg2
 from dotenv import load_dotenv
+import json
 
 # --- Configuration ---
 load_dotenv()
@@ -16,31 +17,25 @@ def get_db_connection():
 def init_db():
     """Creates tables if they don't exist."""
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS requisitions (
-                id SERIAL PRIMARY KEY,
-                requester_info TEXT, item_details TEXT,
-                business_justification TEXT, required_by_date TEXT,
-                approver TEXT, supplier_name TEXT,
-                supplier_address TEXT, supplier_contact TEXT
-            );
-        """)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS supplier_details (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL UNIQUE, address TEXT,
-                contact_number TEXT, is_blacklisted BOOLEAN DEFAULT FALSE
-            );
-        """)
-        conn.commit()
-        cursor.close()
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS requisitions (
+                        id SERIAL PRIMARY KEY, requester_info TEXT, item_details TEXT,
+                        business_justification TEXT, required_by_date TEXT,
+                        approver TEXT, supplier_name TEXT,
+                        supplier_address TEXT, supplier_contact TEXT
+                    );
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS supplier_details (
+                        id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, address TEXT,
+                        contact_number TEXT, is_blacklisted BOOLEAN DEFAULT FALSE
+                    );
+                """)
     except Exception as e:
         print(f"Database initialization failed: {e}")
 
-# Run DB initialization when the function starts
 init_db()
 
 # --- State Management and Constants ---
@@ -56,11 +51,7 @@ def get_user_session_id():
     return request.remote_addr + request.headers.get('User-Agent', '')
 
 def reset_form_state(session_id):
-    user_state[session_id] = {
-        "current_field_index": 0,
-        "form_data": {},
-        "special_state": None
-    }
+    user_state[session_id] = {"current_field_index": 0, "form_data": {}, "special_state": None}
 
 # --- Main API Endpoint ---
 @app.route('/chat', methods=['POST'])
@@ -88,8 +79,8 @@ def chat():
         return process_current_field(session_id, user_input)
 
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return jsonify({'reply': 'An unexpected server error occurred. Please try again later.'}), 500
+        print(f"An unexpected error occurred in chat(): {e}")
+        return jsonify({'reply': 'An unexpected server error occurred. Please check the logs.'}), 500
 
 def process_current_field(session_id, user_input):
     current_state = user_state[session_id]
@@ -97,24 +88,25 @@ def process_current_field(session_id, user_input):
 
     if current_field_name == "Supplier Preference":
         return handle_supplier_preference(session_id, user_input)
-    else:
-        current_state["form_data"][current_field_name] = user_input
-        current_state["current_field_index"] += 1
-        return ask_next_question(session_id)
+    
+    current_state["form_data"][current_field_name] = user_input
+    current_state["current_field_index"] += 1
+    return ask_next_question(session_id)
 
 def handle_supplier_preference(session_id, user_input):
-    current_state = user_state[session_id]
     if user_input.lower() in ['skip', 'none', 'no preference', 'blank']:
-        current_state["form_data"]["Supplier Preference"] = "N/A"
-        current_state["current_field_index"] += 1
+        user_state[session_id]["form_data"]["Supplier Preference"] = "N/A"
+        user_state[session_id]["current_field_index"] += 1
         return ask_next_question(session_id)
     
     status, data = check_supplier_db(user_input)
     if status == "OK":
-        populate_supplier_data(current_state, data)
-        current_state["current_field_index"] += 1
+        populate_supplier_data(user_state[session_id], data)
+        user_state[session_id]["current_field_index"] += 1
         return ask_next_question(session_id)
-    else:
+    elif status == "DB_ERROR":
+        return jsonify({'reply': f"Database Error: {data}"}), 500
+    else: # BLACKLISTED or NOT_FOUND
         return handle_bad_supplier(session_id, status, data)
 
 def handle_supplier_reselection(session_id, user_input):
@@ -131,6 +123,8 @@ def handle_supplier_reselection(session_id, user_input):
         current_state["special_state"] = None
         current_state["current_field_index"] += 1
         return ask_next_question(session_id)
+    elif status == "DB_ERROR":
+        return jsonify({'reply': f"Database Error: {data}"}), 500
     else:
         return handle_bad_supplier(session_id, status, data)
 
@@ -157,16 +151,78 @@ def ask_next_question(session_id):
         return jsonify({'reply': reply_text})
 
 def check_supplier_db(supplier_name):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    # --- THE FIX: Added a comma inside the tuple to correctly pass the parameter ---
-    cursor.execute("SELECT name, address, contact_number, is_blacklisted FROM supplier_details WHERE name ILIKE %s", (supplier_name,))
-    supplier = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    if not supplier: return "NOT_FOUND", supplier_name
-    if supplier[3]: return "BLACKLISTED", supplier[0]
-    return "OK", supplier
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                # --- THE FIX: Using a tuple for parameters is required, even for one item ---
+                cursor.execute("SELECT name, address, contact_number, is_blacklisted FROM supplier_details WHERE name ILIKE %s", (supplier_name,))
+                supplier = cursor.fetchone()
+        
+        if not supplier: return "NOT_FOUND", supplier_name
+        if supplier[3]: return "BLACKLISTED", supplier[0]
+        return "OK", supplier
+    except Exception as e:
+        print(f"DATABASE ERROR in check_supplier_db: {e}")
+        return "DB_ERROR", str(e)
 
 def populate_supplier_data(current_state, supplier_data):
     s_name, s_address, s_contact, _ = supplier_data
+    current_state["form_data"]["Supplier Preference"] = s_name
+    current_state["form_data"]["Supplier Name"] = s_name
+    current_state["form_data"]["Supplier Address"] = s_address
+    current_state["form_data"]["Supplier Contact"] = s_contact
+
+def handle_bad_supplier(session_id, status, supplier_name_data):
+    user_state[session_id]["special_state"] = SUPPLIER_CHECK_STATE
+    message = f"The supplier '{supplier_name_data}' was not found."
+    if status == "BLACKLISTED":
+        message = f"**Warning:** The supplier '{supplier_name_data}' is on our blacklist."
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT name FROM supplier_details WHERE is_blacklisted = FALSE ORDER BY name;")
+                approved_suppliers = "\n- ".join([row[0] for row in cursor.fetchall()])
+        
+        reply_text = f"{message}\nPlease choose an approved supplier, or type 'skip':\n- {approved_suppliers}"
+        return jsonify({'reply': reply_text})
+    except Exception as e:
+        print(f"DATABASE ERROR in handle_bad_supplier: {e}")
+        return jsonify({'reply': 'Error retrieving supplier list.'}), 500
+
+def save_form(session_id):
+    try:
+        form_data = user_state[session_id]['form_data']
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO requisitions (requester_info, item_details, business_justification, required_by_date, approver, supplier_name, supplier_address, supplier_contact)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    form_data.get("Requester Information"), form_data.get("Item/Service Details"),
+                    form_data.get("Business Justification"), form_data.get("Required By Date"),
+                    form_data.get("Approval Section"), form_data.get("Supplier Name"),
+                    form_data.get("Supplier Address"), form_data.get("Supplier Contact")
+                ))
+        reset_form_state(session_id)
+        return jsonify({'reply': "Form saved! You can start a new one by sending 'start'."})
+    except Exception as e:
+        print(f"DATABASE ERROR in save_form: {e}")
+        return jsonify({'reply': f'A database error occurred while saving the form.'}), 500
+
+@app.route('/forms', methods=['GET'])
+def get_forms():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM requisitions ORDER BY id DESC")
+                columns = [desc[0] for desc in cursor.description]
+                forms = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        return jsonify(forms)
+    except Exception as e:
+        return jsonify({'error': f'Could not retrieve forms: {str(e)}'}), 500
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def catch_all(path):
+    return jsonify({"message": "API is running. Use /chat or /forms endpoints."})
